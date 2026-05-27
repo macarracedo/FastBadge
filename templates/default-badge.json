@@ -1,0 +1,67 @@
+{
+  "name": "Default Conference Badge",
+  "description": "Sample 50x30mm landscape label rendered at 203 DPI.",
+  "width_mm": 50,
+  "height_mm": 30,
+  "dpi": 203,
+  "margin_mm": 2,
+  "background": "#ffffff",
+  "logo": {
+    "visible": true,
+    "x_mm": 2,
+    "y_mm": 2,
+    "w_mm": 9,
+    "h_mm": 9,
+    "text": "FB"
+  },
+  "elements": [
+    {
+      "type": "text",
+      "id": "name",
+      "binding": "{{name}}",
+      "x_mm": 2,
+      "y_mm": 13,
+      "font_family": "Arial, sans-serif",
+      "font_size_pt": 15,
+      "font_weight": "bold",
+      "align": "left",
+      "color": "#000000"
+    },
+    {
+      "type": "text",
+      "id": "company",
+      "binding": "{{company}}",
+      "x_mm": 2,
+      "y_mm": 19,
+      "font_family": "Arial, sans-serif",
+      "font_size_pt": 10,
+      "font_weight": "normal",
+      "align": "left",
+      "color": "#000000"
+    },
+    {
+      "type": "text",
+      "id": "role",
+      "binding": "{{role}}",
+      "x_mm": 2,
+      "y_mm": 24,
+      "font_family": "Arial, sans-serif",
+      "font_size_pt": 9,
+      "font_weight": "normal",
+      "align": "left",
+      "color": "#000000"
+    },
+    {
+      "type": "text",
+      "id": "badge_id",
+      "binding": "{{id}}",
+      "x_mm": 48,
+      "y_mm": 2,
+      "font_family": "Arial, sans-serif",
+      "font_size_pt": 8,
+      "font_weight": "normal",
+      "align": "right",
+      "color": "#000000"
+    }
+  ]
+}

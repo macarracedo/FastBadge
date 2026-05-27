@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0f172a" />
+  <title>FastBadge — Event Check-in & Badge Printing</title>
+
+  <!-- html5-qrcode (camera QR scanning) -->
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark">FB</span>
+      <span class="brand-name">FastBadge</span>
+    </div>
+    <div class="header-status">
+      <span id="printerPill" class="pill pill-off" title="Printer connection">
+        <span class="dot"></span> Printer
+      </span>
+      <span id="sheetsPill" class="pill pill-off" title="Google Sheets backend">
+        <span class="dot"></span> Sheets
+      </span>
+    </div>
+  </header>
+
+  <!-- Tab navigation (driven by the lightweight hash router in app.js) -->
+  <nav class="tabbar" role="tablist">
+    <a href="#scanner" class="tab" data-tab="scanner" role="tab">📷 Scanner</a>
+    <a href="#designer" class="tab" data-tab="designer" role="tab">🎨 Designer</a>
+    <a href="#config" class="tab" data-tab="config" role="tab">⚙️ Config</a>
+  </nav>
+
+  <main class="content">
+
+    <!-- ─────────────── SCANNER ─────────────── -->
+    <section id="view-scanner" class="view" data-view="scanner">
+      <div class="card">
+        <h2>Automated check-in</h2>
+        <p class="muted">Point the camera at an attendee's QR code. On a valid scan the
+          attendee is marked <strong>Attended</strong> and their badge is printed automatically.</p>
+
+        <div class="scanner-wrap">
+          <div id="qrReader" class="qr-reader"></div>
+        </div>
+
+        <div class="scanner-controls">
+          <button id="btnScanStart" class="btn btn-primary">Start scanning</button>
+          <button id="btnScanStop" class="btn" disabled>Stop</button>
+          <label class="switch">
+            <input type="checkbox" id="autoPrintToggle" checked />
+            <span>Auto-print on check-in</span>
+          </label>
+        </div>
+
+        <div id="scanResult" class="scan-result" aria-live="polite"></div>
+      </div>
+
+      <div class="card">
+        <h3>Recent check-ins</h3>
+        <ul id="checkinLog" class="checkin-log"></ul>
+      </div>
+    </section>
+
+    <!-- ─────────────── DESIGNER ─────────────── -->
+    <section id="view-designer" class="view" data-view="designer" hidden>
+      <div class="designer-grid">
+        <div class="card">
+          <h2>Badge preview</h2>
+          <p class="muted">Live render of the current template at <span id="canvasMeta">—</span>.</p>
+          <div class="canvas-stage">
+            <canvas id="badgeCanvas"></canvas>
+          </div>
+          <div class="row gap">
+            <button id="btnTestPrint" class="btn btn-primary">🖨 Test print</button>
+            <button id="btnReloadTemplate" class="btn">Reload template</button>
+          </div>
+          <div id="printProgress" class="progress" hidden>
+            <div class="progress-bar"><span></span></div>
+            <span class="progress-label"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Layout controls</h3>
+
+          <label class="field">
+            <span>Sample data</span>
+            <select id="sampleSelect"></select>
+          </label>
+
+          <label class="field">
+            <span>Margin (mm): <output id="marginOut"></output></span>
+            <input type="range" id="marginRange" min="0" max="6" step="0.5" />
+          </label>
+
+          <label class="field">
+            <span>Font scale: <output id="fontScaleOut"></output>×</span>
+            <input type="range" id="fontScaleRange" min="0.5" max="2" step="0.05" />
+          </label>
+
+          <label class="switch">
+            <input type="checkbox" id="logoToggle" checked />
+            <span>Show event logo</span>
+          </label>
+
+          <label class="switch">
+            <input type="checkbox" id="ditherToggle" />
+            <span>Dither (Floyd–Steinberg) for print</span>
+          </label>
+
+          <hr />
+          <h4>Template JSON</h4>
+          <textarea id="templateJson" class="json-area" spellcheck="false"></textarea>
+          <button id="btnApplyJson" class="btn">Apply JSON</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────── CONFIG ─────────────── -->
+    <section id="view-config" class="view" data-view="config" hidden>
+      <div class="card">
+        <h2>Printer connection</h2>
+        <div class="row gap">
+          <button id="btnConnect" class="btn btn-primary">🔗 Connect printer</button>
+          <button id="btnDisconnect" class="btn" disabled>Disconnect</button>
+        </div>
+        <div id="bleUnsupported" class="banner banner-warn" hidden>
+          Web Bluetooth is unavailable in this browser. Use Chrome or Edge served over
+          <code>http://localhost</code> or HTTPS.
+        </div>
+
+        <h3>Hardware status</h3>
+        <dl class="status-grid">
+          <dt>State</dt><dd id="stState">Disconnected</dd>
+          <dt>Device name</dt><dd id="stName">—</dd>
+          <dt>Profile</dt><dd id="stProfile">—</dd>
+          <dt>Service UUID</dt><dd id="stService">—</dd>
+          <dt>Write characteristic</dt><dd id="stWrite">—</dd>
+          <dt>Notify characteristic</dt><dd id="stNotify">—</dd>
+        </dl>
+
+        <h3>Transmission tuning</h3>
+        <div class="row gap wrap">
+          <label class="field sm">
+            <span>BLE chunk size (bytes)</span>
+            <input type="number" id="chunkSize" value="20" min="8" max="512" />
+          </label>
+          <label class="field sm">
+            <span>Inter-chunk pacing (ms)</span>
+            <input type="number" id="pacingMs" value="8" min="0" max="200" />
+          </label>
+          <label class="field sm">
+            <span>Mono threshold (0–255)</span>
+            <input type="number" id="threshold" value="128" min="1" max="254" />
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Label dimensions</h2>
+        <p class="muted">Resizes the design canvas in real time using
+          <strong id="dpiLabel">203</strong> DPI (8 dots/mm).</p>
+        <div class="row gap wrap">
+          <label class="field sm">
+            <span>Width (mm)</span>
+            <input type="number" id="widthMm" min="10" max="120" step="1" />
+          </label>
+          <label class="field sm">
+            <span>Height (mm)</span>
+            <input type="number" id="heightMm" min="10" max="120" step="1" />
+          </label>
+          <label class="field sm">
+            <span>DPI</span>
+            <input type="number" id="dpi" min="100" max="600" step="1" />
+          </label>
+        </div>
+        <p class="muted">Canvas: <span id="pxMeta">—</span></p>
+      </div>
+
+      <div class="card">
+        <h2>Google Sheets</h2>
+        <dl class="status-grid">
+          <dt>Backend mode</dt><dd id="cfgMode">—</dd>
+          <dt>Spreadsheet ID</dt><dd id="cfgSheetId">—</dd>
+          <dt>Range</dt><dd id="cfgRange">—</dd>
+          <dt>Writes enabled</dt><dd id="cfgWrite">—</dd>
+        </dl>
+        <p class="muted">Configure credentials in the server's <code>.env</code> file
+          (see <code>.env.example</code>). Without credentials the backend serves
+          mock attendees so the workflow stays testable.</p>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="js/printer-driver.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
