@@ -5,11 +5,14 @@
  * generic BLE thermal printer:
  *
  *   1. Web Bluetooth: device discovery, GATT connect, characteristic lookup.
- *   2. Image processing: canvas RGBA → grayscale → 1-bit monochrome raster,
- *      packed MSB-first, byte-aligned per row (optional dithering).
+ *   2. Image processing: canvas RGBA → optional rotation → grayscale → 1-bit
+ *      monochrome raster, packed MSB-first, byte-aligned per row (opt. dither).
  *   3. Protocol framing: wrap the raster in ESC/POS `GS v 0` raster command.
- *   4. BLE transport: slice the byte stream into MTU-safe chunks and write
- *      them to the GATT characteristic with pacing.
+ *   4. BLE transport: a serialized print QUEUE slices each byte stream into
+ *      MTU-safe chunks and writes them to the GATT characteristic with pacing,
+ *      so consecutive print jobs never overlap GATT operations.
+ *   5. Audit logging: every meaningful step emits a log entry (console + any
+ *      registered listener) so the BLE flow can be traced.
  *
  * Exposed as a global `PrinterDriver` (no module bundler required).
  */
@@ -66,6 +69,11 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  function now() {
+    return (typeof performance !== 'undefined' && performance.now)
+      ? performance.now() : Date.now();
+  }
+
   class PrinterDriver {
     constructor() {
       this.device = null;
@@ -80,9 +88,18 @@
       this.dither = false;
       this.chunkSize = DEFAULT_CHUNK;
       this.pacingMs = DEFAULT_PACING_MS;
+      this.rotation = 0;            // 0 | 90 | 180 | 270 — applied before binarize
+      this.writeMode = 'auto';      // 'auto' | 'withResponse' | 'noResponse'
+      this.verboseLog = false;      // log every chunk (noisy)
 
-      // Listeners for connection-state changes (UI updates).
+      // Print queue — serializes jobs so GATT operations never overlap.
+      this._queue = [];
+      this._processing = false;
+      this._jobSeq = 0;
+
+      // Listeners.
       this._stateListeners = [];
+      this._logListeners = [];
     }
 
     // ── Capability + state helpers ──────────────────────────────────────────
@@ -95,6 +112,10 @@
       this._stateListeners.push(fn);
     }
 
+    onLog(fn) {
+      this._logListeners.push(fn);
+    }
+
     _emitState() {
       const info = this.getStatus();
       this._stateListeners.forEach((fn) => {
@@ -102,9 +123,21 @@
       });
     }
 
+    /** Emit an audit-log entry to the console and any registered listeners. */
+    _log(level, message, data) {
+      const entry = { t: Date.now(), level, message, data };
+      const sink = console[level] || console.log;
+      try { sink.call(console, '[Printer] ' + message, data != null ? data : ''); } catch (_) { /* ignore */ }
+      this._logListeners.forEach((fn) => {
+        try { fn(entry); } catch (e) { /* ignore */ }
+      });
+      return entry;
+    }
+
     getStatus() {
       return {
         connected: this.connected,
+        hasDevice: !!this.device,
         deviceName: this.device ? (this.device.name || '(unnamed device)') : null,
         deviceId: this.device ? this.device.id : null,
         serviceUuid: this.service ? this.service.uuid : null,
@@ -112,7 +145,10 @@
         notifyCharUuid: this.notifyChar ? this.notifyChar.uuid : null,
         profileName: this.profile ? this.profile.name : null,
         chunkSize: this.chunkSize,
-        pacingMs: this.pacingMs
+        pacingMs: this.pacingMs,
+        rotation: this.rotation,
+        queueLength: this._queue.length,
+        processing: this._processing
       };
     }
 
@@ -128,26 +164,71 @@
         throw new Error('Web Bluetooth is not available. Use Chrome/Edge over http://localhost or https://.');
       }
 
+      this._log('info', 'Requesting device from the browser chooser…');
       this.device = await navigator.bluetooth.requestDevice({
         acceptAllDevices: true,
         optionalServices: OPTIONAL_SERVICES
       });
+      this._log('info', 'Device selected: ' + (this.device.name || '(unnamed)'));
 
-      // React to the printer dropping the link.
-      this.device.addEventListener('gattserverdisconnected', () => {
+      // React to the printer dropping the link. Remove any previous handler
+      // first so reconnecting the same device doesn't stack listeners.
+      if (this._onDisconnect) {
+        this.device.removeEventListener('gattserverdisconnected', this._onDisconnect);
+      }
+      this._onDisconnect = () => {
+        this._log('warn', 'GATT server disconnected.');
         this.connected = false;
         this.server = null;
         this.service = null;
         this.writeChar = null;
         this.notifyChar = null;
         this._emitState();
-      });
+      };
+      this.device.addEventListener('gattserverdisconnected', this._onDisconnect);
 
+      await this._openGatt();
+      return this.getStatus();
+    }
+
+    /** (Re)open the GATT server on the already-selected device and discover. */
+    async _openGatt() {
+      this._log('info', 'Connecting GATT server…');
       this.server = await this.device.gatt.connect();
       await this._discoverProfile();
-
       this.connected = true;
+      this._log('info', 'Connected. Profile: ' + (this.profile ? this.profile.name : '?'));
       this._emitState();
+      // A reconnection may have left jobs waiting in the queue.
+      this._processQueue();
+    }
+
+    /**
+     * Fail-safe: tear the GATT link down and bring it back up on the SAME
+     * device (no chooser). Clears stale characteristic state that can make a
+     * printer ignore everything after the first job.
+     */
+    async resetConnection() {
+      if (!this.device) {
+        throw new Error('No device to reconnect — use "Connect printer" first.');
+      }
+      this._log('warn', 'Resetting connection…');
+      try {
+        if (this.device.gatt && this.device.gatt.connected) {
+          this.device.gatt.disconnect();
+        }
+      } catch (e) {
+        this._log('warn', 'Disconnect during reset threw: ' + e.message);
+      }
+      this.connected = false;
+      this.service = null;
+      this.writeChar = null;
+      this.notifyChar = null;
+      this._emitState();
+      // Give the stack a moment to fully tear down before re-opening.
+      await delay(400);
+      await this._openGatt();
+      this._log('info', 'Reset complete.');
       return this.getStatus();
     }
 
@@ -169,6 +250,7 @@
             this.notifyChar = await service.getCharacteristic(profile.notifyChar);
             await this._subscribeNotifications();
           } catch (_) { this.notifyChar = null; }
+          this._log('debug', 'Matched profile: ' + profile.name);
           return;
         } catch (_) {
           // Not this profile; keep probing.
@@ -189,6 +271,7 @@
           this.notifyChar = chars.find((c) => c.properties.notify) || null;
           this.profile = { name: `Auto-detected (${service.uuid})`, service: service.uuid };
           if (this.notifyChar) await this._subscribeNotifications();
+          this._log('debug', 'Auto-detected writable characteristic on ' + service.uuid);
           return;
         }
       }
@@ -202,7 +285,7 @@
         this.notifyChar.addEventListener('characteristicvaluechanged', (e) => {
           // Printer status bytes; surfaced for debugging.
           const bytes = new Uint8Array(e.target.value.buffer);
-          console.debug('[Printer] notify:', Array.from(bytes));
+          this._log('debug', 'notify: ' + Array.from(bytes).join(','));
         });
       } catch (_) { /* notifications are best-effort */ }
     }
@@ -212,6 +295,7 @@
         this.device.gatt.disconnect();
       }
       this.connected = false;
+      this._log('info', 'Disconnected by user.');
       this._emitState();
     }
 
@@ -225,14 +309,48 @@
       });
     }
 
-    setTuning({ threshold, dither, chunkSize, pacingMs }) {
+    setTuning({ threshold, dither, chunkSize, pacingMs, rotation, writeMode, verboseLog }) {
       if (threshold != null) this.threshold = threshold;
       if (dither != null) this.dither = dither;
       if (chunkSize != null) this.chunkSize = chunkSize;
       if (pacingMs != null) this.pacingMs = pacingMs;
+      if (rotation != null) this.rotation = ((Math.round(rotation / 90) * 90) % 360 + 360) % 360;
+      if (writeMode != null) this.writeMode = writeMode;
+      if (verboseLog != null) this.verboseLog = verboseLog;
     }
 
-    // ── Image processing: canvas → 1-bit monochrome raster ────────────────────
+    // ── Image processing: canvas → (rotate) → 1-bit monochrome raster ─────────
+
+    /**
+     * Return a canvas rotated by this.rotation degrees. 90/270 swap the
+     * dimensions; 0 returns the source unchanged. Used to fix payload
+     * orientation when the label feeds differently than the on-screen design.
+     */
+    _rotateCanvas(canvas) {
+      const deg = this.rotation;
+      if (!deg) return canvas;
+      const swap = (deg === 90 || deg === 270);
+      const out = document.createElement('canvas');
+      out.width = swap ? canvas.height : canvas.width;
+      out.height = swap ? canvas.width : canvas.height;
+      const ctx = out.getContext('2d');
+      // Paint white first so any uncovered area stays "no ink".
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, out.width, out.height);
+      ctx.translate(out.width / 2, out.height / 2);
+      ctx.rotate(deg * Math.PI / 180);
+      ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+      return out;
+    }
+
+    /** Copy a canvas into a detached one so queued jobs are immune to later edits. */
+    _snapshot(canvas) {
+      const out = document.createElement('canvas');
+      out.width = canvas.width;
+      out.height = canvas.height;
+      out.getContext('2d').drawImage(canvas, 0, 0);
+      return out;
+    }
 
     /**
      * Convert an HTMLCanvasElement to a packed monochrome raster bitmap.
@@ -341,43 +459,125 @@
       return out;
     }
 
+    // ── Print queue ───────────────────────────────────────────────────────────
+
+    /**
+     * High-level convenience: render a canvas straight to the printer. The job
+     * is enqueued and processed serially, so consecutive calls never collide
+     * on the GATT characteristic. Returns a promise resolving to bytes sent.
+     */
+    printCanvas(canvas, onProgress) {
+      return this.enqueuePrint(canvas, onProgress);
+    }
+
+    /** Queue a print job. The canvas is snapshotted immediately. */
+    enqueuePrint(canvas, onProgress) {
+      const snapshot = this._snapshot(canvas);
+      return new Promise((resolve, reject) => {
+        const job = { id: ++this._jobSeq, canvas: snapshot, onProgress, resolve, reject };
+        this._queue.push(job);
+        this._log('info', `Job #${job.id} queued (queue length ${this._queue.length}).`);
+        this._emitState();
+        this._processQueue();
+      });
+    }
+
+    /** Drain the queue one job at a time. Safe to call repeatedly. */
+    async _processQueue() {
+      if (this._processing) return;
+      this._processing = true;
+      this._emitState();
+
+      while (this._queue.length) {
+        // Don't pull a job while we have nothing to write to; wait for a
+        // (re)connection to resume the queue instead of failing everything.
+        if (!this.connected || !this.writeChar) {
+          this._log('warn', 'Queue paused — printer not connected. ' +
+            this._queue.length + ' job(s) waiting.');
+          break;
+        }
+
+        const job = this._queue.shift();
+        this._emitState();
+        try {
+          const t0 = now();
+          this._log('info', `Job #${job.id} started (rotation ${this.rotation}°).`);
+          const rotated = this._rotateCanvas(job.canvas);
+          const raster = this.canvasToMonochrome(rotated);
+          const stream = this.buildEscPosRaster(raster);
+          this._log('info',
+            `Job #${job.id}: ${raster.width}×${raster.height}px → ${stream.length} bytes.`);
+          await this.writeStream(stream, job.onProgress, job.id);
+          const ms = Math.round(now() - t0);
+          this._log('info', `Job #${job.id} completed in ${ms} ms (${stream.length} bytes).`);
+          job.resolve(stream.length);
+        } catch (err) {
+          this._log('error', `Job #${job.id} failed: ${err.message}`);
+          job.reject(err);
+        }
+
+        // Settle gap between jobs so the printer's tiny buffer fully drains
+        // before the next ESC @ reset — this is key to multi-print reliability.
+        if (this._queue.length) await delay(Math.max(60, this.pacingMs));
+      }
+
+      this._processing = false;
+      this._emitState();
+    }
+
     // ── BLE transport ─────────────────────────────────────────────────────────
+
+    /** Resolve the effective write method given writeMode + characteristic caps. */
+    _useNoResponse() {
+      const props = this.writeChar.properties;
+      if (this.writeMode === 'withResponse') {
+        return props.write ? false : true; // fall back if only no-response exists
+      }
+      if (this.writeMode === 'noResponse') {
+        return props.writeWithoutResponse ? true : false;
+      }
+      // auto: prefer no-response for throughput, else with-response.
+      return !!props.writeWithoutResponse;
+    }
 
     /**
      * Slice a byte stream into MTU-safe chunks and write them to the GATT
-     * write characteristic. Prefers writeWithoutResponse for throughput and
-     * falls back to writeWithResponse, with a small pacing delay between
+     * write characteristic. Writes are awaited one at a time (so a single
+     * job never overlaps GATT operations), with a small pacing delay between
      * chunks to avoid overrunning the printer's tiny receive buffer.
      */
-    async writeStream(stream, onProgress) {
+    async writeStream(stream, onProgress, jobId) {
       if (!this.connected || !this.writeChar) {
         throw new Error('Printer is not connected.');
       }
 
       const chunk = this.chunkSize || DEFAULT_CHUNK;
-      const useNoResponse = this.writeChar.properties.writeWithoutResponse;
+      const useNoResponse = this._useNoResponse();
+      const total = stream.length;
+      const nChunks = Math.ceil(total / chunk);
+      this._log('debug',
+        `Job #${jobId}: writing ${nChunks} chunk(s) of ${chunk}B ` +
+        `(mode=${useNoResponse ? 'withoutResponse' : 'withResponse'}, pacing=${this.pacingMs}ms).`);
 
-      for (let i = 0; i < stream.length; i += chunk) {
+      for (let i = 0, c = 0; i < total; i += chunk, c++) {
         const slice = stream.slice(i, i + chunk);
-        if (useNoResponse) {
-          await this.writeChar.writeValueWithoutResponse(slice);
-        } else {
-          await this.writeChar.writeValueWithResponse(slice);
+        try {
+          if (useNoResponse) {
+            await this.writeChar.writeValueWithoutResponse(slice);
+          } else {
+            await this.writeChar.writeValueWithResponse(slice);
+          }
+        } catch (err) {
+          this._log('error', `Job #${jobId}: write failed at byte ${i}/${total}: ${err.message}`);
+          throw err;
         }
-        if (onProgress) onProgress(Math.min(i + chunk, stream.length), stream.length);
+        const sent = Math.min(i + chunk, total);
+        if (this.verboseLog) {
+          this._log('debug', `Job #${jobId}: chunk ${c + 1}/${nChunks} sent (${sent}/${total} B).`);
+        }
+        if (onProgress) onProgress(sent, total);
         if (this.pacingMs > 0) await delay(this.pacingMs);
       }
-    }
-
-    /**
-     * High-level convenience: render a canvas straight to the printer.
-     * Returns the number of bytes transmitted.
-     */
-    async printCanvas(canvas, onProgress) {
-      const raster = this.canvasToMonochrome(canvas);
-      const stream = this.buildEscPosRaster(raster);
-      await this.writeStream(stream, onProgress);
-      return stream.length;
     }
   }
 

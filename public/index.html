@@ -31,6 +31,7 @@
   <nav class="tabbar" role="tablist">
     <a href="#scanner" class="tab" data-tab="scanner" role="tab">📷 Scanner</a>
     <a href="#designer" class="tab" data-tab="designer" role="tab">🎨 Designer</a>
+    <a href="#templates" class="tab" data-tab="templates" role="tab">📁 Templates</a>
     <a href="#config" class="tab" data-tab="config" role="tab">⚙️ Config</a>
   </nav>
 
@@ -76,7 +77,7 @@
           </div>
           <div class="row gap">
             <button id="btnTestPrint" class="btn btn-primary">🖨 Test print</button>
-            <button id="btnReloadTemplate" class="btn">Reload template</button>
+            <button id="btnReloadTemplate" class="btn">Reload built-in</button>
           </div>
           <div id="printProgress" class="progress" hidden>
             <div class="progress-bar"><span></span></div>
@@ -107,16 +108,96 @@
             <span>Show event logo</span>
           </label>
 
+          <h4>Image adjustments</h4>
           <label class="switch">
             <input type="checkbox" id="ditherToggle" />
             <span>Dither (Floyd–Steinberg) for print</span>
           </label>
 
+          <label class="field">
+            <span>Mono threshold (0–255): <output id="thresholdOut"></output></span>
+            <input type="range" id="thresholdRange" min="1" max="254" step="1" />
+            <small class="hint">Lower = lighter print, higher = darker. Depends on the
+              document's contrast.</small>
+          </label>
+
+          <label class="field">
+            <span>Print rotation</span>
+            <select id="rotation">
+              <option value="0">0° (none)</option>
+              <option value="90">90° clockwise</option>
+              <option value="180">180°</option>
+              <option value="270">270° (90° counter-clockwise)</option>
+            </select>
+            <small class="hint">Rotates the final print payload before it is binarized
+              and sent — use when the label feeds in a different orientation than the
+              on-screen design (e.g. a 40×12 design fed as 12×40).</small>
+          </label>
+
           <hr />
-          <h4>Template JSON</h4>
-          <textarea id="templateJson" class="json-area" spellcheck="false"></textarea>
+          <h4>Template</h4>
+          <label class="field">
+            <span>Active template</span>
+            <select id="templateSelect"></select>
+          </label>
+          <div id="customTemplateWrap" hidden>
+            <textarea id="templateJson" class="json-area" spellcheck="false"></textarea>
+          </div>
           <button id="btnApplyJson" class="btn">Apply JSON</button>
         </div>
+      </div>
+    </section>
+
+    <!-- ─────────────── TEMPLATES ─────────────── -->
+    <section id="view-templates" class="view" data-view="templates" hidden>
+      <div class="card">
+        <h2>Badge templates</h2>
+        <p class="muted">Create and save reusable badge layouts. Saved templates appear
+          in the Designer's template picker. Templates are stored locally in this browser.</p>
+
+        <div class="row gap wrap end">
+          <label class="field grow">
+            <span>Saved templates</span>
+            <select id="tplManagerSelect"></select>
+          </label>
+          <button id="btnTplNew" class="btn">New blank</button>
+          <button id="btnTplDelete" class="btn">Delete</button>
+        </div>
+
+        <label class="field">
+          <span>Template name</span>
+          <input type="text" id="tplName" placeholder="e.g. VIP Badge 50×30" />
+        </label>
+
+        <h4>Template JSON</h4>
+        <textarea id="tplEditor" class="json-area tall" spellcheck="false"></textarea>
+
+        <div class="row gap">
+          <button id="btnTplSave" class="btn btn-primary">💾 Save template</button>
+          <button id="btnTplPreview" class="btn">Load into Designer</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Expected data fields</h3>
+        <p class="muted">Bind <code>text</code> elements to attendee data with
+          <code>{{placeholders}}</code>. The check-in flow fills in these fields:</p>
+        <dl class="status-grid">
+          <dt>{{name}}</dt><dd>Attendee full name</dd>
+          <dt>{{company}}</dt><dd>Organization / company</dd>
+          <dt>{{role}}</dt><dd>Role (Speaker, Attendee, Keynote…)</dd>
+          <dt>{{id}}</dt><dd>Badge ID (badge_id)</dd>
+        </dl>
+        <p class="muted">A minimal element looks like this:</p>
+        <pre class="snippet">{
+  "type": "text",
+  "id": "name",
+  "binding": "{{name}}",
+  "x_mm": 2, "y_mm": 13,
+  "font_size_pt": 15,
+  "font_weight": "bold",
+  "align": "left"
+}</pre>
       </div>
     </section>
 
@@ -124,8 +205,9 @@
     <section id="view-config" class="view" data-view="config" hidden>
       <div class="card">
         <h2>Printer connection</h2>
-        <div class="row gap">
+        <div class="row gap wrap">
           <button id="btnConnect" class="btn btn-primary">🔗 Connect printer</button>
+          <button id="btnReconnect" class="btn" disabled>♻ Reconnect / Reset</button>
           <button id="btnDisconnect" class="btn" disabled>Disconnect</button>
         </div>
         <div id="bleUnsupported" class="banner banner-warn" hidden>
@@ -143,28 +225,63 @@
           <dt>Notify characteristic</dt><dd id="stNotify">—</dd>
         </dl>
 
-        <h3>Transmission tuning</h3>
-        <div class="row gap wrap">
-          <label class="field sm">
-            <span>BLE chunk size (bytes)</span>
-            <input type="number" id="chunkSize" value="20" min="8" max="512" />
+        <h3>Printer model</h3>
+        <label class="field">
+          <span>Hardware preset</span>
+          <select id="printerModel"></select>
+        </label>
+        <p class="muted">Selecting a model auto-tunes the BLE transfer parameters. Pick
+          <strong>Custom / manual</strong> to set them yourself below.</p>
+
+        <details class="advanced" id="advTransmission">
+          <summary>Advanced transmission settings</summary>
+          <div class="row gap wrap">
+            <label class="field sm">
+              <span>BLE chunk size (bytes)</span>
+              <input type="number" id="chunkSize" value="20" min="8" max="512" />
+            </label>
+            <label class="field sm">
+              <span>Inter-chunk pacing (ms)</span>
+              <input type="number" id="pacingMs" value="8" min="0" max="200" />
+            </label>
+            <label class="field sm">
+              <span>Write mode</span>
+              <select id="writeMode">
+                <option value="auto">Auto</option>
+                <option value="withResponse">With response (reliable)</option>
+                <option value="noResponse">Without response (fast)</option>
+              </select>
+            </label>
+          </div>
+          <small class="hint">If only the first print works after connecting, try
+            <strong>With response</strong> and a higher pacing — it adds flow control so
+            the printer's buffer cannot overrun.</small>
+        </details>
+      </div>
+
+      <div class="card">
+        <h2>BLE transmission log</h2>
+        <p class="muted">Live audit trail of connection, queue and chunk activity.
+          Useful for tracing why a job hangs.</p>
+        <div class="row gap wrap end">
+          <label class="switch">
+            <input type="checkbox" id="verboseLog" />
+            <span>Verbose (log every chunk)</span>
           </label>
-          <label class="field sm">
-            <span>Inter-chunk pacing (ms)</span>
-            <input type="number" id="pacingMs" value="8" min="0" max="200" />
-          </label>
-          <label class="field sm">
-            <span>Mono threshold (0–255)</span>
-            <input type="number" id="threshold" value="128" min="1" max="254" />
-          </label>
+          <button id="btnClearLog" class="btn">Clear log</button>
         </div>
+        <pre id="bleLog" class="ble-log" aria-live="polite"></pre>
       </div>
 
       <div class="card">
         <h2>Label dimensions</h2>
         <p class="muted">Resizes the design canvas in real time using
           <strong id="dpiLabel">203</strong> DPI (8 dots/mm).</p>
-        <div class="row gap wrap">
+        <label class="field">
+          <span>Label size</span>
+          <select id="labelPreset"></select>
+        </label>
+        <div id="customDims" class="row gap wrap" hidden>
           <label class="field sm">
             <span>Width (mm)</span>
             <input type="number" id="widthMm" min="10" max="120" step="1" />
@@ -173,11 +290,11 @@
             <span>Height (mm)</span>
             <input type="number" id="heightMm" min="10" max="120" step="1" />
           </label>
-          <label class="field sm">
-            <span>DPI</span>
-            <input type="number" id="dpi" min="100" max="600" step="1" />
-          </label>
         </div>
+        <label class="field sm">
+          <span>DPI</span>
+          <input type="number" id="dpi" min="100" max="600" step="1" />
+        </label>
         <p class="muted">Canvas: <span id="pxMeta">—</span></p>
       </div>
 

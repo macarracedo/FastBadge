@@ -2,9 +2,10 @@
  * app.js — FastBadge main application logic.
  *
  * Responsibilities:
- *   - Lightweight hash-based tab router (Scanner / Designer / Config).
+ *   - Lightweight hash-based tab router (Scanner / Designer / Templates / Config).
  *   - Badge template loading + canvas rendering (mm/pt → device pixels).
- *   - Real-time label resizing from the Config inputs.
+ *   - Template store (built-in default + user templates saved in localStorage).
+ *   - Real-time label resizing from preset dropdown / custom inputs.
  *   - QR scanner lifecycle (html5-qrcode) + the unattended check-in flow.
  *   - Wiring the PrinterDriver (from printer-driver.js) into the UI.
  */
@@ -13,15 +14,20 @@
   'use strict';
 
   const MM_PER_INCH = 25.4;
+  const TEMPLATES_KEY = 'fastbadge.templates';
+  const CUSTOM = '__custom__';
 
   // ── Application state ──────────────────────────────────────────────────────
   const state = {
-    template: null,          // parsed badge template JSON
+    template: null,          // parsed badge template JSON (active in Designer)
+    templateName: null,      // name of the active template (or CUSTOM)
     sample: null,            // current sample attendee for preview
     marginMm: 2,
     fontScale: 1,
     showLogo: true,
     dither: false,
+    threshold: 128,          // mono cutoff — lives in the Designer now
+    rotation: 0,             // pre-print payload rotation (0/90/180/270)
     backend: null,           // /api/status payload
     scanning: false,
     qr: null,                // Html5Qrcode instance
@@ -38,9 +44,50 @@
     { id: 'A-007', name: 'Bill', company: 'A Really Long Company Name LLC', role: 'Attendee' }
   ];
 
+  // Preconfigured label sizes (mm). "Otro" lets the user type custom dimensions.
+  const LABEL_PRESETS = [
+    { label: '40 × 12 mm', w: 40, h: 12 },
+    { label: '40 × 30 mm', w: 40, h: 30 },
+    { label: '50 × 30 mm', w: 50, h: 30 },
+    { label: '57 × 32 mm', w: 57, h: 32 },
+    { label: '60 × 40 mm', w: 60, h: 40 },
+    { label: '80 × 50 mm', w: 80, h: 50 }
+  ];
+
+  // Printer hardware presets — selecting one auto-tunes the BLE transfer.
+  const PRINTER_MODELS = [
+    { label: 'Generic ESC/POS (safe default)', chunk: 20, pacing: 8 },
+    { label: 'Nordic UART (NUS)', chunk: 20, pacing: 5 },
+    { label: 'Label printer / negotiated MTU (fast)', chunk: 180, pacing: 0 },
+    { label: 'Slow / unstable link', chunk: 16, pacing: 20 },
+    { label: 'Custom / manual', chunk: null, pacing: null }
+  ];
+
+  // Starter layout offered by "New blank" in the Templates view.
+  const STARTER_TEMPLATE = {
+    name: 'New Badge',
+    description: 'Starter template — edit the fields below.',
+    width_mm: 50, height_mm: 30, dpi: 203, margin_mm: 2,
+    background: '#ffffff',
+    logo: { visible: true, x_mm: 2, y_mm: 2, w_mm: 9, h_mm: 9, text: 'FB' },
+    elements: [
+      { type: 'text', id: 'name', binding: '{{name}}', x_mm: 2, y_mm: 13, font_family: 'Arial, sans-serif', font_size_pt: 15, font_weight: 'bold', align: 'left', color: '#000000' },
+      { type: 'text', id: 'company', binding: '{{company}}', x_mm: 2, y_mm: 19, font_family: 'Arial, sans-serif', font_size_pt: 10, font_weight: 'normal', align: 'left', color: '#000000' },
+      { type: 'text', id: 'role', binding: '{{role}}', x_mm: 2, y_mm: 24, font_family: 'Arial, sans-serif', font_size_pt: 9, font_weight: 'normal', align: 'left', color: '#000000' },
+      { type: 'text', id: 'badge_id', binding: '{{id}}', x_mm: 48, y_mm: 2, font_family: 'Arial, sans-serif', font_size_pt: 8, font_weight: 'normal', align: 'right', color: '#000000' }
+    ]
+  };
+
   // ── Small DOM helpers ──────────────────────────────────────────────────────
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+  function addOption(sel, value, label) {
+    const o = document.createElement('option');
+    o.value = value;
+    o.textContent = label;
+    sel.appendChild(o);
+  }
 
   let toastTimer = null;
   function toast(msg, kind) {
@@ -53,10 +100,50 @@
   }
 
   // ════════════════════════════════════════════════════════════════════════
+  // 0. Template store (built-in default + user templates in localStorage)
+  // ════════════════════════════════════════════════════════════════════════
+  const templateStore = {
+    _builtin: null,
+
+    _read() {
+      try {
+        const raw = JSON.parse(localStorage.getItem(TEMPLATES_KEY));
+        return Array.isArray(raw) ? raw : [];
+      } catch (_) { return []; }
+    },
+    _write(list) {
+      localStorage.setItem(TEMPLATES_KEY, JSON.stringify(list));
+    },
+
+    /** All templates: the built-in first, then user-saved ones. */
+    list() {
+      const out = [];
+      if (this._builtin) {
+        out.push({ name: this._builtin.name || 'Default', data: this._builtin, builtin: true });
+      }
+      this._read().forEach((t) => out.push({ name: t.name, data: t.data, builtin: false }));
+      return out;
+    },
+    get(name) {
+      return this.list().find((t) => t.name === name) || null;
+    },
+    save(name, data) {
+      const user = this._read();
+      const i = user.findIndex((t) => t.name === name);
+      if (i >= 0) user[i] = { name, data };
+      else user.push({ name, data });
+      this._write(user);
+    },
+    remove(name) {
+      this._write(this._read().filter((t) => t.name !== name));
+    }
+  };
+
+  // ════════════════════════════════════════════════════════════════════════
   // 1. Tab router
   // ════════════════════════════════════════════════════════════════════════
   function routeTo(tab) {
-    const valid = ['scanner', 'designer', 'config'];
+    const valid = ['scanner', 'designer', 'templates', 'config'];
     if (!valid.includes(tab)) tab = 'scanner';
 
     $$('.view').forEach((v) => { v.hidden = v.dataset.view !== tab; });
@@ -67,6 +154,8 @@
 
     // Re-render the canvas when entering the designer (size may have changed).
     if (tab === 'designer') renderBadge();
+    // Refresh template lists when opening the manager.
+    if (tab === 'templates') refreshTemplateDropdowns();
   }
 
   function initRouter() {
@@ -200,18 +289,33 @@
     ctx.fillText(text, x, y);
   }
 
-  // ── Template loading ───────────────────────────────────────────────────────
-  async function loadTemplate(fromServer) {
+  // ── Template loading + selection ─────────────────────────────────────────
+  async function loadTemplate() {
     try {
-      if (fromServer !== false) {
-        const res = await fetch('/templates/default-badge.json');
-        state.template = await res.json();
-      }
-      applyTemplateToUi();
-      renderBadge();
+      const res = await fetch('/templates/default-badge.json');
+      templateStore._builtin = await res.json();
     } catch (err) {
-      toast('Failed to load template: ' + err.message, 'err');
+      toast('Failed to load built-in template: ' + err.message, 'err');
+      templateStore._builtin = JSON.parse(JSON.stringify(STARTER_TEMPLATE));
+      templateStore._builtin.name = 'Default Conference Badge';
     }
+    refreshTemplateDropdowns();
+    selectTemplate(templateStore._builtin.name);
+    initTemplateEditor();
+  }
+
+  /** Make a template the active one in the Designer and render it. */
+  function selectTemplate(name) {
+    const entry = templateStore.get(name);
+    if (!entry) return;
+    state.template = JSON.parse(JSON.stringify(entry.data));
+    state.templateName = name;
+    applyTemplateToUi();
+    renderBadge();
+    const sel = $('#templateSelect');
+    if (sel) sel.value = name;
+    const wrap = $('#customTemplateWrap');
+    if (wrap) wrap.hidden = true;
   }
 
   /** Push template metadata into the Config/Designer inputs. */
@@ -227,11 +331,49 @@
     $('#fontScaleRange').value = state.fontScale;
     $('#fontScaleOut').textContent = state.fontScale.toFixed(2);
     $('#templateJson').value = JSON.stringify(t, null, 2);
+    syncLabelPreset();
   }
 
   // ════════════════════════════════════════════════════════════════════════
-  // 3. Real-time label resizing (Config inputs)
+  // 3. Label dimensions (preset dropdown + custom inputs)
   // ════════════════════════════════════════════════════════════════════════
+  function bindLabelPreset() {
+    const sel = $('#labelPreset');
+    LABEL_PRESETS.forEach((p, i) => addOption(sel, String(i), p.label));
+    addOption(sel, CUSTOM, 'Otro (personalizado)…');
+
+    sel.addEventListener('change', () => {
+      if (sel.value === CUSTOM) {
+        $('#customDims').hidden = false;
+        return;
+      }
+      const p = LABEL_PRESETS[parseInt(sel.value, 10)];
+      if (!p || !state.template) return;
+      $('#customDims').hidden = true;
+      state.template.width_mm = p.w;
+      state.template.height_mm = p.h;
+      $('#widthMm').value = p.w;
+      $('#heightMm').value = p.h;
+      renderBadge();
+    });
+  }
+
+  /** Reflect the active template's dimensions in the preset dropdown. */
+  function syncLabelPreset() {
+    const sel = $('#labelPreset');
+    if (!sel || !state.template) return;
+    const idx = LABEL_PRESETS.findIndex(
+      (p) => p.w === state.template.width_mm && p.h === state.template.height_mm
+    );
+    if (idx >= 0) {
+      sel.value = String(idx);
+      $('#customDims').hidden = true;
+    } else {
+      sel.value = CUSTOM;
+      $('#customDims').hidden = false;
+    }
+  }
+
   function bindDimensionInputs() {
     const apply = () => {
       if (!state.template) return;
@@ -286,12 +428,47 @@
       printer.setTuning({ dither: state.dither });
     });
 
-    $('#btnReloadTemplate').addEventListener('click', () => loadTemplate(true));
+    // Mono threshold now lives with the image adjustments (depends on contrast,
+    // not on the BLE connection).
+    $('#thresholdRange').value = state.threshold;
+    $('#thresholdOut').textContent = state.threshold;
+    $('#thresholdRange').addEventListener('input', (e) => {
+      state.threshold = parseInt(e.target.value, 10);
+      $('#thresholdOut').textContent = state.threshold;
+      printer.setTuning({ threshold: state.threshold });
+    });
+
+    // Pre-print payload rotation (fixes orientation when the label feeds the
+    // opposite way to the on-screen design). Applies only to the print stream.
+    $('#rotation').value = String(state.rotation);
+    $('#rotation').addEventListener('change', (e) => {
+      state.rotation = parseInt(e.target.value, 10) || 0;
+      printer.setTuning({ rotation: state.rotation });
+    });
+
+    // Template picker: pick a saved template, or "Otro" to edit raw JSON.
+    $('#templateSelect').addEventListener('change', () => {
+      const v = $('#templateSelect').value;
+      if (v === CUSTOM) {
+        $('#customTemplateWrap').hidden = false;
+        $('#templateJson').value = JSON.stringify(state.template, null, 2);
+        state.templateName = CUSTOM;
+      } else {
+        selectTemplate(v);
+      }
+    });
+
+    $('#btnReloadTemplate').addEventListener('click', () => loadTemplate());
+
     $('#btnApplyJson').addEventListener('click', () => {
       try {
         state.template = JSON.parse($('#templateJson').value);
+        state.templateName = CUSTOM;
         applyTemplateToUi();
         renderBadge();
+        const tsel = $('#templateSelect');
+        if (tsel) tsel.value = CUSTOM;
+        $('#customTemplateWrap').hidden = false;
         toast('Template applied.', 'ok');
       } catch (err) {
         toast('Invalid JSON: ' + err.message, 'err');
@@ -299,6 +476,98 @@
     });
 
     $('#btnTestPrint').addEventListener('click', () => printCurrentBadge());
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 4b. Template manager view
+  // ════════════════════════════════════════════════════════════════════════
+  function refreshTemplateDropdowns() {
+    const list = templateStore.list();
+
+    const desig = $('#templateSelect');
+    if (desig) {
+      const prev = state.templateName;
+      desig.innerHTML = '';
+      list.forEach((t) => addOption(desig, t.name, t.name + (t.builtin ? ' (built-in)' : '')));
+      addOption(desig, CUSTOM, 'Otro (custom JSON)…');
+      if (prev && (prev === CUSTOM || templateStore.get(prev))) desig.value = prev;
+    }
+
+    const mgr = $('#tplManagerSelect');
+    if (mgr) {
+      const prev = mgr.value;
+      mgr.innerHTML = '';
+      list.forEach((t) => addOption(mgr, t.name, t.name + (t.builtin ? ' (built-in)' : '')));
+      if (prev && templateStore.get(prev)) mgr.value = prev;
+    }
+  }
+
+  function loadIntoTemplateEditor(name) {
+    const entry = templateStore.get(name);
+    if (!entry) return;
+    // Built-in is read-only: clear the name so a save creates a copy.
+    $('#tplName').value = entry.builtin ? '' : entry.name;
+    $('#tplEditor').value = JSON.stringify(entry.data, null, 2);
+  }
+
+  function initTemplateEditor() {
+    const sel = $('#tplManagerSelect');
+    if (sel && sel.value) loadIntoTemplateEditor(sel.value);
+  }
+
+  function bindTemplateManager() {
+    const sel = $('#tplManagerSelect');
+
+    sel.addEventListener('change', () => loadIntoTemplateEditor(sel.value));
+
+    $('#btnTplNew').addEventListener('click', () => {
+      $('#tplName').value = '';
+      $('#tplEditor').value = JSON.stringify(STARTER_TEMPLATE, null, 2);
+      toast('Blank template ready — give it a name and save.', 'ok');
+    });
+
+    $('#btnTplSave').addEventListener('click', () => {
+      const name = $('#tplName').value.trim();
+      if (!name) { toast('Enter a template name first.', 'warn'); return; }
+      let data;
+      try {
+        data = JSON.parse($('#tplEditor').value);
+      } catch (err) {
+        toast('Invalid JSON: ' + err.message, 'err');
+        return;
+      }
+      if (templateStore._builtin && name === (templateStore._builtin.name || 'Default')) {
+        toast('That name is reserved for the built-in template. Choose another.', 'warn');
+        return;
+      }
+      templateStore.save(name, data);
+      refreshTemplateDropdowns();
+      sel.value = name;
+      toast('Template saved.', 'ok');
+    });
+
+    $('#btnTplDelete').addEventListener('click', () => {
+      const name = sel.value;
+      const entry = templateStore.get(name);
+      if (!entry) return;
+      if (entry.builtin) { toast('The built-in template cannot be deleted.', 'warn'); return; }
+      templateStore.remove(name);
+      // If the deleted template was active in the Designer, fall back to built-in.
+      if (state.templateName === name && templateStore._builtin) {
+        selectTemplate(templateStore._builtin.name);
+      }
+      refreshTemplateDropdowns();
+      loadIntoTemplateEditor(sel.value);
+      toast('Template deleted.', 'ok');
+    });
+
+    $('#btnTplPreview').addEventListener('click', () => {
+      const name = sel.value;
+      if (!templateStore.get(name)) return;
+      selectTemplate(name);
+      location.hash = 'designer';
+      toast('Loaded into Designer.', 'ok');
+    });
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -351,25 +620,78 @@
 
     $('#btnDisconnect').addEventListener('click', () => printer.disconnect());
 
-    ['#chunkSize', '#pacingMs', '#threshold'].forEach((sel) =>
+    $('#btnReconnect').addEventListener('click', async () => {
+      try {
+        toast('Reconnecting…');
+        await printer.resetConnection();
+        toast('Printer reconnected.', 'ok');
+      } catch (err) {
+        toast('Reconnect failed: ' + err.message, 'err');
+      }
+    });
+
+    ['#chunkSize', '#pacingMs', '#writeMode'].forEach((sel) =>
       $(sel).addEventListener('change', applyTuning)
     );
 
+    $('#verboseLog').addEventListener('change', (e) =>
+      printer.setTuning({ verboseLog: e.target.checked })
+    );
+    $('#btnClearLog').addEventListener('click', () => { $('#bleLog').textContent = ''; });
+
+    // Stream the driver's audit log into the debug panel.
+    printer.onLog(appendBleLog);
+
     printer.onStateChange(updatePrinterStatus);
     updatePrinterStatus(printer.getStatus());
+  }
+
+  function appendBleLog(entry) {
+    const el = $('#bleLog');
+    if (!el) return;
+    const time = new Date(entry.t).toLocaleTimeString();
+    el.textContent += `[${time}] ${entry.level.toUpperCase().padEnd(5)} ${entry.message}\n`;
+    // Keep the buffer bounded so long sessions don't grow without limit.
+    if (el.textContent.length > 20000) el.textContent = el.textContent.slice(-15000);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  /** Printer-model dropdown auto-tunes the BLE transfer parameters. */
+  function bindPrinterModel() {
+    const sel = $('#printerModel');
+    PRINTER_MODELS.forEach((m, i) => addOption(sel, String(i), m.label));
+
+    sel.addEventListener('change', () => {
+      const m = PRINTER_MODELS[parseInt(sel.value, 10)];
+      if (!m) return;
+      if (m.chunk == null) {
+        // Custom / manual → reveal the advanced panel for hand-tuning.
+        $('#advTransmission').open = true;
+        return;
+      }
+      $('#chunkSize').value = m.chunk;
+      $('#pacingMs').value = m.pacing;
+      applyTuning();
+    });
   }
 
   function applyTuning() {
     printer.setTuning({
       chunkSize: clampNum($('#chunkSize').value, 8, 512, 20),
       pacingMs: clampNum($('#pacingMs').value, 0, 200, 8),
-      threshold: clampNum($('#threshold').value, 1, 254, 128),
-      dither: state.dither
+      threshold: state.threshold,
+      dither: state.dither,
+      rotation: state.rotation,
+      writeMode: $('#writeMode') ? $('#writeMode').value : 'auto',
+      verboseLog: $('#verboseLog') ? $('#verboseLog').checked : false
     });
   }
 
   function updatePrinterStatus(s) {
-    $('#stState').textContent = s.connected ? 'Connected' : 'Disconnected';
+    let stateText = s.connected ? 'Connected' : 'Disconnected';
+    if (s.queueLength) stateText += ` · ${s.queueLength} job(s) queued`;
+    else if (s.processing) stateText += ' · printing…';
+    $('#stState').textContent = stateText;
     $('#stName').textContent = s.deviceName || '—';
     $('#stProfile').textContent = s.profileName || '—';
     $('#stService').textContent = s.serviceUuid || '—';
@@ -378,6 +700,9 @@
 
     $('#btnDisconnect').disabled = !s.connected;
     $('#btnConnect').disabled = s.connected || !PrinterDriver.isSupported();
+    // Reconnect/reset stays available whenever a device has been chosen, even
+    // after a drop — that's its whole point as a fail-safe.
+    $('#btnReconnect').disabled = !s.hasDevice || !PrinterDriver.isSupported();
 
     const pill = $('#printerPill');
     pill.classList.toggle('pill-on', s.connected);
@@ -562,10 +887,14 @@
   function init() {
     initRouter();
     bindDimensionInputs();
+    bindLabelPreset();
     bindDesignerControls();
     bindPrinterUi();
+    bindPrinterModel();
+    bindTemplateManager();
     bindScanner();
-    loadTemplate(true);
+    printer.setTuning({ threshold: state.threshold, rotation: state.rotation });
+    loadTemplate();
     loadBackendStatus();
   }
 
